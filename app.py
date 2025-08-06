@@ -1,4 +1,5 @@
 import os
+import threading
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file, session
 from flask_mail import Mail, Message
 from werkzeug.utils import secure_filename
@@ -20,12 +21,23 @@ app.config.update(
 
 mail = Mail(app)
 
+
+# Function to send email asynchronously
+def send_async_email(app, msg):
+    with app.app_context():
+        try:
+            mail.send(msg)
+        except Exception as e:
+            print(f"Failed to send email: {e}")
+
+
 # Upload path
 UPLOAD_FOLDER = 'static/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 DB = 'forms.db'
+
 
 def init_db():
     with sqlite3.connect(DB) as conn:
@@ -48,7 +60,9 @@ def init_db():
         cur.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('form_opacity', '0.8'))
         conn.commit()
 
+
 init_db()
+
 
 def get_setting(key):
     with sqlite3.connect(DB) as conn:
@@ -57,11 +71,13 @@ def get_setting(key):
         row = cur.fetchone()
         return row[0] if row else None
 
+
 def set_setting(key, value):
     with sqlite3.connect(DB) as conn:
         cur = conn.cursor()
         cur.execute('REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
         conn.commit()
+
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -84,17 +100,87 @@ def index():
             ''', tuple(data.values()))
             conn.commit()
 
-        # Send notification to yourself
-        msg = Message("Nieuwe formulierinzending", recipients=["daanmarsmans@gmail.com"])
-        msg.body = "\n".join(f"{k}: {v}" for k, v in data.items())
-        mail.send(msg)
+        # Send notification to yourself asynchronously
+        try:
+            msg = Message("Nieuwe formulierinzending", recipients=["daanmarsmans@gmail.com"])
+            msg.body = "\n".join(f"{k}: {v}" for k, v in data.items())
+
+            # Send email in a background thread
+            threading.Thread(target=send_async_email, args=(app, msg)).start()
+        except Exception as e:
+            print(f"Error preparing email: {e}")
+            # Continue with the form submission even if email fails
 
         # Flash visible confirmation
-        flash("Dankjewel, hopelijk zien we je op de bruiloft!", "success")
+        flash("Dank je wel, hopelijk zijn we je op de bruiloft!", "success")
 
     background = get_setting('background_image')
     opacity = get_setting('form_opacity')
     return render_template('index.html', background=background, opacity=opacity)
+
+
+@app.route('/admin', methods=['GET', 'POST'])
+def admin():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        if 'background' in request.files:
+            file = request.files['background']
+            if file.filename:
+                filename = secure_filename(file.filename)
+                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                set_setting('background_image', filename)
+
+        if 'opacity' in request.form:
+            set_setting('form_opacity', request.form['opacity'])
+
+    background = get_setting('background_image')
+    opacity = get_setting('form_opacity')
+
+    with sqlite3.connect(DB) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM submissions ORDER BY submitted_at DESC")
+        rows = cur.fetchall()
+
+    return render_template('admin.html', submissions=rows, background=background, opacity=opacity)
+
+
+@app.route('/download')
+def download():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+
+    with sqlite3.connect(DB) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM submissions")
+        rows = cur.fetchall()
+
+    filepath = 'submissions.csv'
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['ID', 'Naam', 'Email', 'Straat', 'Plaats', 'Postcode', 'Telefoon', 'Inzenddatum'])
+        writer.writerows(rows)
+
+    return send_file(filepath, as_attachment=True)
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        if (request.form['username'] == 'Daan' and request.form['password'] == 'GeefJeHartNietZoMaarWeg2!') or \
+                (request.form['username'] == 'Leonie' and request.form['password'] == 'GeefJeHartNietZoMaarWeg2!'):
+            session['logged_in'] = True
+            return redirect(url_for('admin'))
+        else:
+            flash("Ongeldige inloggegevens", "danger")
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
 
 @app.route('/delete/<int:entry_id>', methods=['POST'])
@@ -120,67 +206,6 @@ def delete_entry(entry_id):
 
     return redirect(url_for('admin'))
 
-@app.route('/admin', methods=['GET', 'POST'])
-def admin():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-
-    if request.method == 'POST':
-        if 'background' in request.files:
-            file = request.files['background']
-            if file.filename:
-                filename = secure_filename(file.filename)
-                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-                set_setting('background_image', filename)
-
-        if 'opacity' in request.form:
-            set_setting('form_opacity', request.form['opacity'])
-            flash("Instellingen bijgewerkt", "success")
-
-    background = get_setting('background_image')
-    opacity = get_setting('form_opacity')
-
-    with sqlite3.connect(DB) as conn:
-        conn.row_factory = sqlite3.Row  # This makes the rows accessible by column name
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM submissions ORDER BY submitted_at DESC")
-        rows = cur.fetchall()
-
-    return render_template('admin.html', submissions=rows, background=background, opacity=opacity)
-
-@app.route('/download')
-def download():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-
-    with sqlite3.connect(DB) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM submissions")
-        rows = cur.fetchall()
-
-    filepath = 'submissions.csv'
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['ID', 'Naam', 'Email', 'Straat', 'Plaats', 'Postcode', 'Telefoon', 'Inzenddatum'])
-        writer.writerows(rows)
-
-    return send_file(filepath, as_attachment=True)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        if (request.form['username'] == 'Daan' and request.form['password'] == 'GeefJeHartNietZoMaarWeg2!') or \
-           (request.form['username'] == 'Leonie' and request.form['password'] == 'GeefJeHartNietZoMaarWeg2!'):
-            session['logged_in'] = True
-            return redirect(url_for('admin'))
-        else:
-            flash("Ongeldige inloggegevens", "danger")
-    return render_template('login.html')
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
 
 if __name__ == '__main__':
     app.run(debug=True)
